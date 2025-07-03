@@ -1,4 +1,4 @@
-# Extended Flask App for MedTrack with AWS DynamoDB and SNS Integration
+# Extended Flask App for MedTrack with AWS Enhancements
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
@@ -18,60 +18,88 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "default_secret_key")
 
-AWS_REGION = os.getenv("AWS_REGION")
-dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-sns = boto3.client('sns', region_name=AWS_REGION)
+# AWS & App Configs
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+dynamodb = boto3.resource(
+    'dynamodb',
+    region_name=AWS_REGION,
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
 
-users_table = dynamodb.Table(os.getenv("DYNAMODB_TABLE_USERS"))
-appointments_table = dynamodb.Table(os.getenv("DYNAMODB_TABLE_APPOINTMENTS"))
+sns = boto3.client(
+    'sns',
+    region_name=AWS_REGION,
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+
+USERS_TABLE_NAME = os.getenv("DYNAMODB_TABLE_USERS", "UsersTable")
+APPOINTMENTS_TABLE_NAME = os.getenv("DYNAMODB_TABLE_APPOINTMENTS", "AppointmentsTable")
+user_table = dynamodb.Table(USERS_TABLE_NAME)
+appointment_table = dynamodb.Table(APPOINTMENTS_TABLE_NAME)
+
 SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
+ENABLE_SNS = os.getenv("ENABLE_SNS", "False").lower() == "true"
 
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SENDER_EMAIL = os.getenv("SMTP_EMAIL")
+SENDER_PASSWORD = os.getenv("SMTP_PASSWORD")
+ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "False").lower() == "true"
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+
+# Context processor for templates
 @app.context_processor
 def inject_now():
     return {'now': datetime.now()}
 
-# ---------- Helper: Send Email ----------
+# Health check for AWS ALB
+@app.route('/health')
+def health():
+    return {'status': 'healthy'}, 200
+
+# Email Helper
+
 def send_email(to_email, subject, message):
-    from_email = os.getenv("SMTP_EMAIL")
-    password = os.getenv("SMTP_PASSWORD")
-
-    msg = MIMEMultipart()
-    msg['From'] = from_email
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(message, 'html'))
-
+    if not ENABLE_EMAIL:
+        logger.info(f"[Email Disabled] Skipping email to {to_email}")
+        return
     try:
-        with smtplib.SMTP_SSL(os.getenv("SMTP_SERVER"), int(os.getenv("SMTP_PORT"))) as server:
-            server.login(from_email, password)
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(message, 'html'))
+
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.send_message(msg)
-        logging.info(f"Email sent to {to_email}")
+        logger.info(f"Email sent to {to_email}")
     except Exception as e:
-        logging.error(f"Email failed to send: {e}")
+        logger.error(f"Failed to send email to {to_email}: {e}")
 
-# ---------- Helper: Send SNS Notification ----------
+# SNS Helper
+
 def notify_sns(subject, message):
+    if not ENABLE_SNS or not SNS_TOPIC_ARN:
+        logger.info("[SNS Disabled] Skipping publish")
+        return
     try:
-        sns.publish(
+        response = sns.publish(
             TopicArn=SNS_TOPIC_ARN,
             Message=message,
             Subject=subject
         )
-        logging.info("SNS notification sent.")
+        logger.info(f"SNS published: {response.get('MessageId')}")
     except Exception as e:
-        logging.error(f"SNS notification failed: {e}")
-
-# ---------- Custom Error Handlers ----------
-@app.errorhandler(404)
-def page_not_found(e):
-    return render_template("404.html"), 404
-
-@app.errorhandler(500)
-def internal_server_error(e):
-    return render_template("500.html"), 500
+        logger.error(f"Failed to publish SNS: {e}")
 
 
-# ---------- Routes ----------
+# Routes
 @app.route('/')
 def home():
     return render_template('index.html')
@@ -93,8 +121,7 @@ def signup():
             flash("Passwords do not match.", "danger")
             return redirect(url_for('signup'))
 
-        response = users_table.get_item(Key={'email': email})
-        if 'Item' in response:
+        if user_table.get_item(Key={'email': email}).get('Item'):
             flash("Email already registered.", "danger")
             return redirect(url_for('signup'))
 
@@ -103,7 +130,8 @@ def signup():
             'type': user_type,
             'name': name,
             'email': email,
-            'password': generate_password_hash(password)
+            'password': generate_password_hash(password),
+            'created_at': datetime.utcnow().isoformat()
         }
 
         if user_type == 'patient':
@@ -125,7 +153,9 @@ def signup():
                 'mobile': request.form.get('mobile')
             })
 
-        users_table.put_item(Item=user)
+        user_table.put_item(Item=user)
+        notify_sns("New Signup", f"{user_type} {name} registered with email {email}.")
+        send_email(email, "Welcome to MedTrack", f"<p>Hi {name}, welcome to MedTrack!</p>")
         flash("Signup successful. Please log in.", "success")
         return redirect(url_for('login'))
 
@@ -134,20 +164,18 @@ def signup():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        role = request.form.get('role')
         email = request.form.get('email')
         password = request.form.get('password')
+        role = request.form.get('role')
 
-        response = users_table.get_item(Key={'email': email})
-        user = response.get('Item')
-
-        if user and check_password_hash(user['password'], password) and user['type'] == role:
-            session['user'] = user['email']
-            session['role'] = user['type']
+        user = user_table.get_item(Key={'email': email}).get('Item')
+        if user and user['type'] == role and check_password_hash(user['password'], password):
+            session['user'] = email
+            session['role'] = role
             flash("Login successful!", "success")
             return redirect(url_for(f"{role}_dashboard"))
 
-        flash("Invalid credentials or role mismatch.", "danger")
+        flash("Invalid credentials or role.", "danger")
         return redirect(url_for('login'))
 
     return render_template('login.html')
@@ -160,107 +188,132 @@ def logout():
 
 @app.route('/patient/dashboard')
 def patient_dashboard():
-    if 'user' not in session or session.get('role') != 'patient':
-        flash("Please log in as a patient.", "danger")
+    if session.get('role') != 'patient':
+        flash("Unauthorized access.", "danger")
         return redirect(url_for('login'))
-
-    patient_email = session['user']
-    user = users_table.get_item(Key={'email': patient_email}).get('Item')
-    appts = appointments_table.scan(FilterExpression=Attr('patient_email').eq(patient_email))['Items']
-    pending = sum(1 for a in appts if a['status'] == 'Pending')
-    completed = sum(1 for a in appts if a['status'] == 'Completed')
-
-    doctors = users_table.scan(FilterExpression=Attr('type').eq('doctor'))['Items']
-
-    return render_template('patient_dashboard.html', user=user, appointments=appts, doctors=doctors, pending=pending, completed=completed, total=len(appts))
+    email = session['user']
+    user = user_table.get_item(Key={'email': email}).get('Item')
+    appointments = appointment_table.scan(FilterExpression=Attr('patient_email').eq(email))['Items']
+    doctors = user_table.scan(FilterExpression=Attr('type').eq('doctor'))['Items']
+    return render_template('patient_dashboard.html', user=user, appointments=appointments, doctors=doctors)
 
 @app.route('/doctor/dashboard')
 def doctor_dashboard():
-    if 'user' not in session or session.get('role') != 'doctor':
-        flash("Please log in as a doctor.", "danger")
+    if session.get('role') != 'doctor':
+        flash("Unauthorized access.", "danger")
         return redirect(url_for('login'))
+    email = session['user']
+    user = user_table.get_item(Key={'email': email}).get('Item')
+    appointments = appointment_table.scan(FilterExpression=Attr('doctor_email').eq(email))['Items']
+    return render_template('doctor_dashboard.html', user=user, appointments=appointments)
 
-    doctor_email = session['user']
-    user = users_table.get_item(Key={'email': doctor_email}).get('Item')
-    appts = appointments_table.scan(FilterExpression=Attr('doctor_id').eq(doctor_email))['Items']
-    pending = sum(1 for a in appts if a['status'] == 'Pending')
-    completed = sum(1 for a in appts if a['status'] == 'Completed')
+# ---------- Appointment Routes ----------
 
-    return render_template('doctor_dashboard.html', user=user, appointments=appts, pending=pending, completed=completed, total=len(appts))
-
-
-# ---------- Additional Routes for Appointments ----------
-@app.route('/book-appointment', methods=['GET', 'POST'])
+@app.route('/book_appointment', methods=['GET', 'POST'])
 def book_appointment():
-    if 'user' not in session or session.get('role') != 'patient':
-        flash("Please log in as a patient to book an appointment.", "danger")
+    if not is_logged_in() or session.get('role') != 'patient':
+        flash('Only patients can book appointments', 'danger')
         return redirect(url_for('login'))
 
     if request.method == 'POST':
-        doctor_email = request.form.get('doctor_id')
-        date = request.form.get('appointment_date')
-        time = request.form.get('appointment_time')
-        symptoms = request.form.get('symptoms', '')
+        doctor_email = request.form.get('doctor_email')
+        symptoms = request.form.get('symptoms')
+        appointment_date = request.form.get('appointment_date')
+        appointment_time = request.form.get('appointment_time')
+        patient_email = session.get('email')
 
-        appointment = {
-            'appointment_id': str(uuid.uuid4()),
-            'patient_email': session['user'],
-            'doctor_id': doctor_email,
-            'date': date,
-            'time': time,
-            'status': 'Pending',
+        if not doctor_email or not symptoms or not appointment_date or not appointment_time:
+            flash('Please fill all fields', 'danger')
+            return redirect(url_for('book_appointment'))
+
+        doctor = user_table.get_item(Key={'email': doctor_email}).get('Item')
+        patient = user_table.get_item(Key={'email': patient_email}).get('Item')
+
+        appointment_id = str(uuid.uuid4())
+        appointment_item = {
+            'appointment_id': appointment_id,
+            'doctor_email': doctor_email,
+            'doctor_name': doctor.get('name', 'Doctor'),
+            'patient_email': patient_email,
+            'patient_name': patient.get('name', 'Patient'),
             'symptoms': symptoms,
-            'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            'status': 'pending',
+            'appointment_date': appointment_date,
+            'appointment_time': appointment_time,
+            'created_at': datetime.utcnow().isoformat()
         }
 
-        appointments_table.put_item(Item=appointment)
+        appointment_table.put_item(Item=appointment_item)
 
-        doctor_response = users_table.get_item(Key={'email': doctor_email})
-        doctor = doctor_response.get('Item')
+        if ENABLE_EMAIL:
+            send_email(doctor_email, "New Appointment", f"New appointment from {patient['name']} on {appointment_date} at {appointment_time}")
+            send_email(patient_email, "Appointment Booked", f"Your appointment with Dr. {doctor.get('name')} is booked on {appointment_date} at {appointment_time}")
 
-        subject = "New Appointment Booked"
-        message = f"<h3>New Appointment</h3><p>You have a new appointment on {date} at {time}.<br>Symptoms: {symptoms}</p>"
-        if doctor and 'email' in doctor:
-            send_email(doctor['email'], subject, message)
-            notify_sns(subject, f"Doctor {doctor['name']} has a new appointment from {session['user']} on {date} at {time}.")
+        publish_to_sns(f"New appointment booked by {patient['name']} with Dr. {doctor.get('name')} for {appointment_date} at {appointment_time}")
 
-        flash("Appointment booked successfully! Notification sent to doctor.", "success")
+        flash('Appointment booked successfully', 'success')
         return redirect(url_for('patient_dashboard'))
 
-    doctor_dict = users_table.scan(FilterExpression=Attr('type').eq('doctor'))['Items']
-    return render_template('book_appointment.html', doctors=doctor_dict)
+    try:
+        response = user_table.scan(FilterExpression=boto3.dynamodb.conditions.Attr('role').eq('doctor'))
+        doctors = response['Items']
+    except Exception as e:
+        logger.error(f"Failed fetching doctors: {e}")
+        doctors = []
 
-@app.route('/view-appointment/<appointment_id>')
+    return render_template('book_appointment.html', doctors=doctors)
+
+@app.route('/view_appointment/<appointment_id>')
 def view_appointment_patient(appointment_id):
-    response = appointments_table.scan(FilterExpression=Attr('appointment_id').eq(appointment_id))
-    items = response.get('Items', [])
-    if not items:
-        flash("Appointment not found.", "danger")
+    if not is_logged_in() or session.get('role') != 'patient':
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('login'))
+
+    try:
+        response = appointment_table.get_item(Key={'appointment_id': appointment_id})
+        appointment = response.get('Item')
+        if not appointment:
+            flash('Appointment not found', 'danger')
+            return redirect(url_for('patient_dashboard'))
+
+        if session.get('email') != appointment['patient_email']:
+            flash('Access denied', 'danger')
+            return redirect(url_for('patient_dashboard'))
+
+        doctor = user_table.get_item(Key={'email': appointment['doctor_email']}).get('Item')
+        return render_template("view_appointment_patient.html", appointment=appointment, doctor=doctor)
+
+    except Exception as e:
+        logger.error(f"Error fetching appointment details: {e}")
+        flash('An error occurred while retrieving the appointment.', 'danger')
         return redirect(url_for('patient_dashboard'))
 
-    appt = items[0]
-    if session.get('user') != appt['patient_email']:
-        flash("Access denied.", "danger")
-        return redirect(url_for('patient_dashboard'))
-
-    doctor = users_table.get_item(Key={'email': appt['doctor_id']}).get('Item')
-    return render_template("view_appointment_patient.html", appointment=appt, doctor=doctor)
 
 @app.route('/doctor/view-appointment/<appointment_id>')
 def view_appointment_doctor(appointment_id):
-    response = appointments_table.scan(FilterExpression=Attr('appointment_id').eq(appointment_id))
-    items = response.get('Items', [])
-    if not items:
-        flash("Appointment not found.", "danger")
+    try:
+        response = appointment_table.get_item(Key={'appointment_id': appointment_id})
+        appointment = response.get('Item')
+        if not appointment:
+            flash("Appointment not found.", "danger")
+            return redirect(url_for('doctor_dashboard'))
+
+        if session.get('role') != 'doctor' or session.get('email') != appointment['doctor_email']:
+            flash("Unauthorized access.", "danger")
+            return redirect(url_for('doctor_dashboard'))
+
+        patient = user_table.get_item(Key={'email': appointment['patient_email']}).get('Item')
+        return render_template("view_appointment_doctor.html", appointment=appointment, patient=patient)
+
+    except Exception as e:
+        logger.error(f"Error fetching appointment: {e}")
+        flash("An error occurred.", "danger")
         return redirect(url_for('doctor_dashboard'))
 
-    appt = items[0]
-    patient = users_table.get_item(Key={'email': appt['patient_email']}).get('Item')
-    return render_template("view_appointment_doctor.html", appointment=appt, patient=patient)
 
 @app.route('/doctor/submit-diagnosis/<appointment_id>', methods=['POST'])
 def submit_diagnosis(appointment_id):
-    if 'user' not in session or session.get('role') != 'doctor':
+    if not session.get('email') or session.get('role') != 'doctor':
         flash("Unauthorized access.", "danger")
         return redirect(url_for('login'))
 
@@ -268,53 +321,112 @@ def submit_diagnosis(appointment_id):
     treatment_plan = request.form.get('treatment_plan')
     prescription = request.form.get('prescription')
 
-    response = appointments_table.scan(FilterExpression=Attr('appointment_id').eq(appointment_id))
-    items = response['Items']
-    if items:
-        appointment = items[0]
-        appointment.update({
-            'diagnosis': diagnosis,
-            'treatment_plan': treatment_plan,
-            'prescription': prescription,
-            'status': 'Completed'
-        })
-        appointments_table.put_item(Item=appointment)
+    try:
+        response = appointment_table.get_item(Key={'appointment_id': appointment_id})
+        appointment = response.get('Item')
+
+        if not appointment:
+            flash("Appointment not found.", "danger")
+            return redirect(url_for('doctor_dashboard'))
+
+        if session.get('email') != appointment['doctor_email']:
+            flash("Unauthorized access.", "danger")
+            return redirect(url_for('doctor_dashboard'))
+
+        appointment_table.update_item(
+            Key={'appointment_id': appointment_id},
+            UpdateExpression="SET diagnosis = :d, treatment_plan = :t, prescription = :p, #s = :s, updated_at = :u",
+            ExpressionAttributeValues={
+                ':d': diagnosis,
+                ':t': treatment_plan,
+                ':p': prescription,
+                ':s': 'completed',
+                ':u': datetime.utcnow().isoformat()
+            },
+            ExpressionAttributeNames={'#s': 'status'}
+        )
+
+        # Optional: send email or SNS notification here
+        if ENABLE_EMAIL:
+            send_email(
+                appointment['patient_email'],
+                "Appointment Completed",
+                f"Dear {appointment['patient_name']}, your appointment with Dr. {appointment['doctor_name']} has been completed.\nDiagnosis: {diagnosis}\nTreatment Plan: {treatment_plan}"
+            )
+
+        publish_to_sns(
+            f"Appointment completed by Dr. {appointment['doctor_name']} for {appointment['patient_name']}.",
+            subject="Appointment Completed"
+        )
+
         flash("Diagnosis submitted successfully.", "success")
-    else:
-        flash("Appointment not found.", "danger")
+    except Exception as e:
+        logger.error(f"Error submitting diagnosis: {e}")
+        flash("An error occurred while submitting diagnosis.", "danger")
 
     return redirect(url_for('doctor_dashboard'))
 
 @app.route('/patient/profile')
 def patient_profile():
-    email = session.get('user')
+    email = session.get('email')
     if not email or session.get('role') != 'patient':
         flash("Unauthorized access.", "danger")
         return redirect(url_for('login'))
-    user = users_table.get_item(Key={'email': email}).get('Item')
-    return render_template("patient_profile.html", user=user)
 
+    try:
+        user = user_table.get_item(Key={'email': email}).get('Item')
+        if not user:
+            flash("User not found.", "danger")
+            return redirect(url_for('login'))
+        return render_template("patient_profile.html", user=user)
+    except Exception as e:
+        logger.error(f"Error fetching patient profile: {e}")
+        flash("An error occurred.", "danger")
+        return redirect(url_for('login'))
+    
 @app.route('/doctor/profile')
 def doctor_profile():
-    email = session.get('user')
+    email = session.get('email')
     if not email or session.get('role') != 'doctor':
         flash("Unauthorized access.", "danger")
         return redirect(url_for('login'))
-    user = users_table.get_item(Key={'email': email}).get('Item')
-    return render_template("doctor_profile.html", user=user)
 
-@app.route('/forgot-password', methods=['GET', 'POST'])
+    try:
+        user = user_table.get_item(Key={'email': email}).get('Item')
+        if not user:
+            flash("User not found.", "danger")
+            return redirect(url_for('login'))
+        return render_template("doctor_profile.html", user=user)
+    except Exception as e:
+        logger.error(f"Error fetching doctor profile: {e}")
+        flash("An error occurred.", "danger")
+        return redirect(url_for('login'))
+
+    
+@app.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
     if request.method == 'POST':
         email = request.form.get('email')
-        response = users_table.get_item(Key={'email': email})
+        response = user_table.get_item(Key={'email': email})
         user = response.get('Item')
         if user:
-            flash("Password reset link sent (simulated).", "success")
+            flash("Password reset link sent (simulated)", "success")
         else:
-            flash("Email not found.", "danger")
+            flash("Email not found", "danger")
         return redirect(url_for('login'))
     return render_template('forgot_password.html')
 
+
+# Error Pages
+@app.errorhandler(404)
+def not_found(e):
+    return render_template("404.html"), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template("500.html"), 500
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.getenv('PORT', 5000))
+    debug = os.getenv('FLASK_ENV') == 'development'
+    app.run(host='0.0.0.0', port=port, debug=debug)
