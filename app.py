@@ -19,7 +19,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "default_secret_key")
 
 # AWS & App Configs
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 dynamodb = boto3.resource(
     'dynamodb',
     region_name=AWS_REGION,
