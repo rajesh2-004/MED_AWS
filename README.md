@@ -1,4 +1,4 @@
-Here’s a **detailed and professional `README.md`** file for your **MedTrack - Hospital Management System** project. This includes sections like demo, setup, usage, deployment, contribution, and licensing, making it well-suited for GitHub and showcasing your project professionally.
+Here is your updated and complete `README.md` file with your **GitHub profile** and **email address** added in the **Contact** section:
 
 ---
 
@@ -13,7 +13,7 @@ MedTrack is a modern, cloud-enabled **Hospital Management System** built using *
 
 Want to see MedTrack in action?
 
-▶️ **[Click here to watch the demo video](https://drive.google.com/file/d/1sYUUprING8gGX2NBhDYq8f5z7x7nDUcs/view?usp=sharing)**
+▶️ **[Click here to watch the demo video](https://drive.google.com/file/d/1sYUUprING8gGX2NBhDYq8f5z7x7nDUcs/view?usp=drive_link)**
 
 ---
 
@@ -57,7 +57,7 @@ Make sure you have the following installed:
 ### 📥 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/medtrack.git
+git clone https://github.com/rajesh2-004/medtrack.git
 cd medtrack
 ````
 
@@ -149,14 +149,14 @@ To contribute:
 4. Push to the branch (`git push origin feature/YourFeature`)
 5. Open a Pull Request
 
+---
 
 
 ## 💬 Contact
 
-Feel free to reach out if you have suggestions or feedback.
+If you have any questions, suggestions, or collaboration ideas, feel free to reach out:
 
-📧 Email: [your.email@example.com](mailto:your.email@example.com)
-🔗 GitHub: [yourusername](https://github.com/yourusername)
+* 📧 **Email:** [rajeshuppada5@gmail.com](mailto:rajeshuppada5@gmail.com)
+* 🧑‍💻 **GitHub:** [rajesh2-004](https://github.com/rajesh2-004)
 
 ---
-
